@@ -1,0 +1,287 @@
+import toad
+import pandas as pd
+import numpy as np
+import math
+#变量的类型
+def choose_vartypes(dt,strcols=[],continuscols=[]):
+    strcols= list(set(strcols))
+    if len(strcols)>0: dt[strcols]=dt[strcols].astype(str)
+    continuscols= list(set(continuscols))
+    if len(continuscols)>0: dt[continuscols]=dt[continuscols].astype(float)
+
+    #没有指定的变量自动识别    
+    strcol=dt.select_dtypes("object").columns
+    dt[strcol]=dt[strcol].astype(str)
+
+    return dt
+
+#变量的分布
+def overview(dt,target,withY = False):
+
+#    dt：传入的数据，
+#    target：目标变量名
+
+#    返回：str_vars 类别型变量概览,value_vars 数值型变量概览
+    EDA_detect=toad.detector.detect(dt)
+    if withY:
+        quality = toad.quality(dt,target)
+        quality.drop(["unique"],axis=1,inplace=True)
+        EDA_result=EDA_detect.join(quality)
+        EDA_result=EDA_result.sort_values(by="iv",ascending=False)
+    else:
+        EDA_result = EDA_detect
+ 
+    EDA_result["type"]=EDA_result["type"].astype(str).apply(lambda x:'类别型' if x=="object" else "数值型" if x not in ['类别型',"数值型"] else x)
+    str_vars_renamedict={'type':'变量类型','size':'数据量','missing':'缺失率','unique':'唯一值数量','mean_or_top1':'前1','std_or_top2':'前2','min_or_top3':'前3','1%_or_top4':'前4','10%_or_top5':'前5','50%_or_bottom5':'后5','75%_or_bottom4':'后4','90%_or_bottom3':'后3','99%_or_bottom2':'后2',
+                   'max_or_bottom1':'后1'}
+
+    value_vars_renamedict={'type':'变量类型','size':'数据量','missing':'缺失率','unique':'唯一值数量','mean_or_top1':'均值','std_or_top2':'标准差','min_or_top3':'最小值','1%_or_top4':'1%分>位','10%_or_top5':'10%分位','50%_or_bottom5':'50%分位','75%_or_bottom4':'75%分位','90%_or_bottom3':'90%分位',
+                           '99%_or_bottom2':'99分位','max_or_bottom1':'最大值' }
+
+    str_vars=EDA_result.loc[EDA_result["type"]=="类别型"].rename(columns=str_vars_renamedict)
+    value_vars=EDA_result.loc[EDA_result["type"]=="数值型"].rename(columns=value_vars_renamedict)
+
+    return str_vars,value_vars
+	
+#分组函数
+def grouping(dt, feature_name, label, target, orderbybadrate=False, vartype = 'cata'):
+    dt['bad'] = dt['cnt'] = dt[target]
+    dt['min'] = dt['max'] = dt[feature_name]
+    dt['Bucket'] = dt[feature_name]
+    #agg聚合 ：集合，最大，最小，取总，取坏总。index标签不输出
+    dt = dt.groupby(label, as_index = False).agg({
+               'Bucket':set,
+               'min':get_min,
+               'max':get_max,
+               'cnt':'count',
+               'bad':'sum'
+               })    
+    
+    if orderbybadrate:
+        dt['badrate'] = dt['bad'] / dt['cnt']
+        dt = dt.sort_values(by = 'badrate', ascending = True).reset_index(drop=True)
+        #dt.drop('badrate', axis = 1, inplace = True)
+    if vartype == 'continuous':
+        dt['Bucket'] = dt[label]  
+        
+    return dt
+
+def get_min(x):
+    try:
+        values = np.nanmin(x)#返回非空最小值
+    except:
+        values = np.nan
+    return values
+    
+def get_max(x):
+    try:
+        values = np.nanmax(x)
+    except:
+        values = np.nan
+    return values
+
+def meet_minsamples(woerp, minsamples):    
+    return woerp['cnt'].min() >= minsamples
+def unionallset(setlist):
+    value = set()
+    for each in setlist:
+        value = value.union(each)
+    return value
+
+def merge_catavar(woe_rp):
+    woe_rp = woe_rp.groupby('bins_id', as_index = False).agg({
+                                                          'Bucket': unionallset,
+                                                          'min':get_min,
+                                                          'max':get_max,
+                                                          'cnt':'sum',
+                                                          'bad':'sum',
+                                                         })    
+    woe_rp['bins_id'] = range(len(woe_rp))
+    return woe_rp
+
+def chi_merge(woe_rp, vartype = 'cata'):
+    assert vartype in ['cata', 'continuous']
+    confidenceVal = 1#置信值
+    #confidenceVal = 0.00003
+    minchi2 = 0.5#最小卡方值
+    while minchi2 < confidenceVal and len(woe_rp) >= 2:
+        chi2df = pd.DataFrame()
+        for i in range(0, len(woe_rp) - 1):
+            temp = woe_rp[i:i+2]
+            expected_badrate = temp['bad'].sum()/temp['cnt'].sum()#计算坏账率
+            expected_goodrate = 1 - expected_badrate#计算好比率
+            temp['expected_bad'] = temp['cnt'] * expected_badrate#坏的个数
+            temp['expected_good'] = temp['cnt'] * expected_goodrate#好的个数            
+            temp['chi2'] = ((temp['bad'] - temp['expected_bad'])**2)/temp['expected_bad'] + ((temp['cnt'] - temp['bad'] - temp['expected_good'])**2)/temp['expected_good']#计算卡方
+            
+            temp['total_chi2'] = temp['chi2'].sum()#计算卡方
+            chi2df = chi2df.append(temp) 
+            
+        if len(chi2df) > 0:
+            minchi2 = chi2df['total_chi2'].min()#取最小卡方
+            merge_labels = chi2df.loc[chi2df['total_chi2'] == minchi2, 'bins_id'].tolist()[:2]#取需要合并的行
+            merge_labels = [int(x) for x in merge_labels]
+            woe_rp['bins_id'].replace(merge_labels, min(merge_labels), inplace=True)#保留小的行代替原来的两行
+            minchi2 = chi2df.loc[chi2df['total_chi2'] > minchi2, 'total_chi2'].min()#最小卡方改为卡方次小值
+        if vartype == 'cata':
+            woe_rp = merge_catavar(woe_rp)#计算合并后的分箱结果
+        elif vartype == 'continuous':
+            woe_rp = merge_continunousvar(woe_rp)
+
+    return woe_rp
+
+def my_point(a,b):
+    return (a,b)
+#保序分箱
+def pavabinning(dt, target, feature_name):
+    break_points = pavabinning0_(dt, target, feature_name)
+    
+    break_points.remove(min(break_points))
+    break_points.extend([-np.inf, np.inf])
+    break_points = sorted(break_points)    
+    return break_points
+
+def pavabinning0_(dt, target, feature_name):
+    dt = dt[[target, feature_name]].dropna().copy()
+    dt['cnt'] = dt[target]
+    dt = dt.groupby(feature_name, as_index = False).agg({
+                                                       target:'sum',
+                                                       'cnt':   'count'
+                                                       }
+                                                       )
+    
+    dt = dt.dropna()
+    dt['badrate'] = dt[target] / dt['cnt']
+    is_positive_corr = dt[feature_name].corr(dt['badrate']) > 0#是否与坏账率正相关
+    dt = dt.sort_values(by = feature_name, ascending = is_positive_corr)#按照相关性排序
+    ir = IsotonicRegression(increasing = is_positive_corr)
+    param = {'sample_weight': dt['cnt']}
+    y1_ = ir.fit_transform(dt[feature_name], dt['badrate'], **param) 
+    
+    ir2 = IsotonicRegression(increasing = not is_positive_corr)
+    y2_ = ir.fit_transform(dt[feature_name], dt['badrate'], **param)
+    
+    leny1_, leny2_ = len(set(y1_)), len(set(y2_))
+    if leny1_ > leny2_ or leny1_ == leny2_:
+        dt['y_'] = y1_
+    else:
+        dt['y_'] = y2_
+    
+    break_points = sorted(
+          dt.groupby('y_', as_index = False).agg({feature_name:'min'})[feature_name].unique().tolist())
+    
+    return break_points
+
+def merge_woe_rp(woe_rp, minsamples, max_num_bin, stop_limit=0.01, merge_method='chimerge', vartype='continuous'):
+    lastbinnum = len(woe_rp) + 1
+    iv_diff = 10
+    lasttotaliv = 0
+    while (not meet_minsamples(woe_rp, minsamples)) or len(woe_rp) > max_num_bin:
+        if len(woe_rp) <= 1 or lastbinnum == len(woe_rp):
+            break
+        else:
+            lastbinnum = len(woe_rp)
+            if merge_method == 'chimerge':
+                woe_rp = chi_merge(woe_rp, vartype=vartype)
+            elif merge_method == 'pava':
+                woe_rp = chi_merge(woe_rp, vartype=vartype)
+            elif merge_method == 'highestIV':
+                woe_rp = chi_merge(woe_rp, vartype=vartype)
+            else:
+                raise Exception('必须指定一种合并分箱的逻辑')
+            iv = cal_iv(woe_rp['bad'], woe_rp['cnt'] - woe_rp['bad'])['total_iv'].max()
+            iv_diff = iv - lasttotaliv
+            lasttotaliv = iv
+    return woe_rp
+
+def merge_continunousvar(woe_rp):
+    woe_rp = woe_rp.groupby('bins_id', as_index = False).agg({
+                                                          'Bucket': union_bucket,
+                                                          'min':get_min,
+                                                          'max':get_max,
+                                                          'cnt':'sum',
+                                                          'bad':'sum',
+                                                         })    
+    woe_rp['bins_id'] = range(len(woe_rp))
+    return woe_rp
+
+def union_bucket(bckt):
+    left = min([x.left for x in bckt])
+    right = max([x.right for x in bckt])
+    bckt = pd.Interval(left,right,'left')
+    return bckt
+
+def cal_iv(bad, good):
+    woe_dt = pd.DataFrame({'bad':bad,
+                           'good':good
+                         })
+    woe_dt['badrate'] = woe_dt['bad'] /(woe_dt['bad'] + woe_dt['good'])
+    woe_dt.replace(0, 0.9, inplace = True)
+    Pbad = woe_dt['bad'] /woe_dt['bad'].sum()
+    Pgood = woe_dt['good'] /woe_dt['good'].sum()
+    woe_dt['woe'] = np.log(Pbad /Pgood)
+    woe_dt['iv'] = (Pbad - Pgood) * woe_dt['woe']
+    woe_dt['total_iv'] = woe_dt['iv'].sum()
+    woe_dt.drop(['bad', 'good'], axis = 1, inplace=True)
+
+    for each in ['badrate','woe','iv','total_iv']:
+        woe_dt[each] = np.round(woe_dt[each], 5)    
+    return woe_dt
+
+#离散*连续非单调 
+def cata_num2(dt, target, feature1,feature2, minsamples, max_num_bin,cata_num1_dict):
+    woe_rp = grouping(dt, feature1, feature1, target, orderbybadrate = True)
+    woe_rp['bins_id'] = range(len(woe_rp)) 
+    woe_rp.loc[woe_rp['badrate'] == 0, 'bins_id'] =  woe_rp.loc[woe_rp['badrate'] > 0, 'bins_id'].min()
+    woe_rp.loc[woe_rp['badrate'] == 1, 'bins_id'] =  woe_rp.loc[woe_rp['badrate'] < 1, 'bins_id'].max()
+    while not (meet_minsamples(woe_rp, minsamples) and len(woe_rp) <= max_num_bin):#while循环，没有分箱小于最小样本数，且分箱数少于最大分箱
+            if len(woe_rp) <= 1:
+                break
+            else:
+                woe_rp = chi_merge(woe_rp)#卡方分箱，计算各节点的卡方值，将最小的卡方值节点合并
+    clist = woe_rp['Bucket']
+    for col in clist:
+        dt_copy = dt[(dt[feature1].isin(col))]
+        breaks = list(set(pd.qcut(dt_copy[feature2], math.ceil(1/0.01), duplicates = 'drop').apply(lambda x: x.left).tolist()))
+        breaks.remove(min(breaks))
+        breaks.extend([-np.inf, np.inf])
+        bckt = pd.cut(x = dt_copy[feature2], bins = sorted(breaks), right = False)
+        dt_copy['bins_id'] = bckt
+        woe_rp = grouping(dt_copy,feature2, 'bins_id',target, orderbybadrate = False, vartype = 'continuous')
+        woe_rp['bins_id'] = range(len(woe_rp))
+        woe_rp = merge_woe_rp(woe_rp, minsamples, max_num_bin, merge_method = 'pava', vartype = 'continuous')
+        woe_rp['badrate'] = woe_rp['bad'] / woe_rp['cnt']
+        woe_rp['good'] = woe_rp['cnt'] - woe_rp['bad']
+        woe_rp['goodrate'] = woe_rp['good']/woe_rp['cnt']
+        woe_rp['badrate'] = woe_rp['bad']/woe_rp['cnt']
+        Pbad = woe_rp['bad'] /woe_rp['bad'].sum()
+        Pgood = woe_rp['good'] /woe_rp['good'].sum()
+        woe_rp['woe'] = np.log(Pbad /Pgood)
+        woe_rp['iv'] = (Pbad - Pgood) * woe_rp['woe']
+        woe_rp['total_iv'] = woe_rp['iv'].sum()
+        cata_num1_dict[str(col)] = woe_rp
+    return cata_num1_dict
+
+#离散*离散 函数
+def cata_cata(dt, target, feature1,feature2, minsamples, max_num_bin):
+    feature = feature1 + '_' + feature2
+    dt[feature]=dt.apply(lambda row:my_point(row[feature1],row[feature2]),axis=1)
+    woe_rp = grouping(dt, feature, feature, target, orderbybadrate = True)
+    woe_rp['bins_id'] = range(len(woe_rp)) 
+    woe_rp.loc[woe_rp['badrate'] == 0, 'bins_id'] =  woe_rp.loc[woe_rp['badrate'] > 0, 'bins_id'].min()
+    woe_rp.loc[woe_rp['badrate'] == 1, 'bins_id'] =  woe_rp.loc[woe_rp['badrate'] < 1, 'bins_id'].max()
+    while not (meet_minsamples(woe_rp, minsamples) and len(woe_rp) <= max_num_bin):#while循环，没有分箱小于最小样本数，且分箱数少于最大分箱
+            if len(woe_rp) <= 1:
+                break
+            else:
+                woe_rp = chi_merge(woe_rp)#卡方分箱，计算各节点的卡方值，将最小的卡方值节点合并
+    woe_rp['badrate'] = woe_rp['bad'] / woe_rp['cnt']
+    woe_rp['good'] = woe_rp['cnt'] - woe_rp['bad']
+    woe_rp['goodrate'] = woe_rp['good']/woe_rp['cnt']
+    woe_rp['badrate'] = woe_rp['bad']/woe_rp['cnt']
+    Pbad = woe_rp['bad'] /woe_rp['bad'].sum()
+    Pgood = woe_rp['good'] /woe_rp['good'].sum()
+    woe_rp['woe'] = np.log(Pbad /Pgood)
+    woe_rp['iv'] = (Pbad - Pgood) * woe_rp['woe']
+    woe_rp['total_iv'] = woe_rp['iv'].sum()
+    return woe_rp
